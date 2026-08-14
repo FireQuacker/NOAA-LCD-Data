@@ -15,11 +15,12 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 class NOAA_WBGT_Fetcher:
-  """Standalone collector for NOAA Global Hourly (ISD) data using NOAA Open Data
+  """Optimized multi-step collector for NOAA Global Hourly (ISD) data using
 
-  Dissemination (NODD) AWS S3 buckets. Features auto-station discovery,
-  strict active-date filtering, local caching, RH calculation, spatial timezone
-  conversion, working-hour filtering, and live execution logging.
+  NOAA Open Data Dissemination (NODD) AWS S3 buckets. Features geographic
+  radius filtering, ICAO airport station prioritization, local caching,
+  robust column validation, spatial timezone conversion, and working-hour
+  filtering.
   """
 
   def __init__(self, cache_dir="./noaa_cache"):
@@ -51,16 +52,15 @@ class NOAA_WBGT_Fetcher:
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
-  def get_candidate_stations(
-      self, target_lat, target_lon, target_date_str, logs, max_candidates=30
+  def get_filtered_candidate_stations(
+      self, target_lat, target_lon, target_date_str, logs, max_radius_miles=50.0
   ):
-    """Retrieves master station history list, filters out inactive stations
+    """Step 1 & 2: Fetches master station list, calculates distance,
 
-    based on target date, removes placeholder stations, and ranks remaining
-    candidates by distance.
+    filters by radius, removes placeholders, and prioritizes ICAO airport stations.
     """
     logs.append(
-        "Fetching NOAA master station history list (isd-history.csv)..."
+        "Step 1: Fetching NOAA master station history list (isd-history.csv)..."
     )
     try:
       response = self.session.get(self.station_history_url, timeout=30)
@@ -85,50 +85,52 @@ class NOAA_WBGT_Fetcher:
     df = df[(df["LAT"] != 0.0) | (df["LON"] != 0.0)].copy()
 
     # Clean and parse USAF identifiers and filter out placeholder '999999' stations
-    df["USAF_CLEAN"] = df["USAF"].astype(str).str.strip().str.split(".").str[0].str.zfill(6)
+    df["USAF_CLEAN"] = (
+        df["USAF"].astype(str).str.strip().str.split(".").str[0].str.zfill(6)
+    )
     df = df[df["USAF_CLEAN"] != "999999"].copy()
 
-    # Clean and parse the END date column (Format: YYYYMMDD)
-    df["END_CLEAN"] = pd.to_numeric(
-        df["END"].astype(str).str[:8], errors="coerce"
-    )
-    target_date_int = int(
-        datetime.strptime(target_date_str, "%Y-%m-%d").strftime("%Y%m%d")
-    )
-
-    # Strictly filter for stations that have data extending past our target date
-    active_stations = df[df["END_CLEAN"] >= target_date_int].copy()
-
-    if active_stations.empty:
-      logs.append(
-          "WARNING: No strictly active stations found extending past target"
-          " date. Falling back to all historical non-placeholder station entries."
-      )
-      active_stations = df.copy()
-
     logs.append(
-        "Evaluating distance across"
-        f" {len(active_stations)} valid candidate stations..."
+        f"Step 2: Calculating distances and filtering stations within"
+        f" {max_radius_miles} miles..."
     )
-    active_stations["DIST_MILES"] = active_stations.apply(
+    df["DIST_MILES"] = df.apply(
         lambda row: self._haversine_distance(
             target_lat, target_lon, row["LAT"], row["LON"]
         ),
         axis=1,
     )
 
-    # Sort stations strictly by distance ascending
-    sorted_candidates = active_stations.sort_values(
-        by="DIST_MILES"
-    ).head(max_candidates)
+    # Restrict candidate pool strictly to the specified radius
+    radius_df = df[df["DIST_MILES"] <= max_radius_miles].copy()
+    if radius_df.empty:
+      logs.append(
+          "WARNING: No stations found within the strict radius. Expanding"
+          " search to the 15 closest global stations..."
+      )
+      radius_df = df.sort_values(by="DIST_MILES").head(15).copy()
+
+    # Step 3: Identify and prioritize stations with valid ICAO codes (ASOS/AWOS/METAR airport weather stations)
+    radius_df["ICAO"] = radius_df["ICAO"].astype(str).str.strip()
+    radius_df["HAS_ICAO"] = radius_df["ICAO"].apply(
+        lambda x: 1 if x and x.upper() != "NAN" and len(x) >= 3 else 0
+    )
+
+    # Sort primarily by ICAO presence (1 first), then by distance ascending
+    sorted_candidates = radius_df.sort_values(
+        by=["HAS_ICAO", "DIST_MILES"], ascending=[False, True]
+    ).reset_index(drop=True)
+
+    logs.append(
+        f"Shortlisted {len(sorted_candidates)} viable stations near target"
+        " coordinates (ICAO airport stations prioritized)."
+    )
     return sorted_candidates, None
 
   def get_hourly_data(self, target_lat, target_lon, target_date_str):
-    """Retrieves, parses, and cleans hourly weather data from NOAA S3 bucket.
+    """Step 4 & 5: Iteratively queries NOAA S3 storage for shortlisted stations,
 
-    Executes an iterative download loop over nearby active candidate stations.
-    Adjusts output to local time based on coordinates and filters for
-    08:00-17:00.
+    validates weather variables, localizes timezones, and extracts working hours.
     """
     logs = []
     target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
@@ -140,7 +142,7 @@ class NOAA_WBGT_Fetcher:
         f" {target_lon:.4f}, Date: {target_date_str} ({days_ago} days ago)"
     )
 
-    candidates_df, err = self.get_candidate_stations(
+    candidates_df, err = self.get_filtered_candidate_stations(
         target_lat, target_lon, target_date_str, logs
     )
     if candidates_df is None or candidates_df.empty:
@@ -150,7 +152,12 @@ class NOAA_WBGT_Fetcher:
     selected_station_name = None
     selected_local_path = None
 
-    # Fallback Loop: Iterate through candidates in order of proximity until a valid CSV is downloaded from AWS S3
+    logs.append(
+        "Step 3 & 4: Iterating through prioritized station shortlist to test"
+        " NOAA S3 archive availability..."
+    )
+
+    # Step 5: Sequential query loop over prioritized short list
     for _, row in candidates_df.iterrows():
       usaf = row["USAF_CLEAN"]
       raw_wban = str(row["WBAN"]).strip().split(".")[0]
@@ -158,6 +165,7 @@ class NOAA_WBGT_Fetcher:
 
       station_id = f"{usaf}{wban}"
       station_name = str(row.get("STATION NAME", "UNKNOWN")).strip()
+      icao_code = str(row.get("ICAO", ""))
       dist_miles = row["DIST_MILES"]
 
       file_name = f"{station_id}.csv"
@@ -169,45 +177,55 @@ class NOAA_WBGT_Fetcher:
             os.path.getmtime(local_path)
         ).date()
         if target_date > file_mod_time:
-          logs.append(
-              f"Cache Notice ({station_id}): Target date is newer than local"
-              " cache. Clearing cache..."
-          )
           os.remove(local_path)
         else:
           logs.append(
               f"Cache Hit: Found valid cached dataset for '{station_name}'"
-              f" (ID: {station_id}) [{dist_miles:.2f} mi away]."
+              f" (ID: {station_id}, ICAO: {icao_code}) [{dist_miles:.2f} mi"
+              " away]."
           )
           selected_station_id = station_id
           selected_station_name = station_name
           selected_local_path = local_path
           break
 
-      # Attempt remote download from NOAA S3 bucket
       download_url = f"{self.s3_base_url}{target_year}/{file_name}"
       logs.append(
-          f"Testing station '{station_name}' (ID: {station_id}) [{dist_miles:.2f} mi away] -> {download_url}"
+          f"Testing station '{station_name}' (ID: {station_id}, ICAO:"
+          f" {icao_code}) [{dist_miles:.2f} mi away] -> {download_url}"
       )
 
       try:
         response = self.session.get(download_url, timeout=20)
         if response.status_code == 200 and len(response.content) > 100:
-          with open(local_path, "wb") as out_file:
-            out_file.write(response.content)
-          logs.append(
-              f"SUCCESS: Connected to NOAA S3 Storage and saved"
-              f" {len(response.content)} bytes for station '{station_name}'"
-              f" (ID: {station_id})."
+          # Verify the CSV contains necessary surface weather columns before accepting
+          sample_df = pd.read_csv(
+              StringIO(response.text), nrows=5, low_memory=False
           )
-          selected_station_id = station_id
-          selected_station_name = station_name
-          selected_local_path = local_path
-          break
+          if (
+              "TMP" in sample_df.columns
+              and "DEW" in sample_df.columns
+              and "WND" in sample_df.columns
+          ):
+            with open(local_path, "wb") as out_file:
+              out_file.write(response.content)
+            logs.append(
+                f"SUCCESS: Validated and downloaded {len(response.content)}"
+                f" bytes for station '{station_name}' (ID: {station_id})."
+            )
+            selected_station_id = station_id
+            selected_station_name = station_name
+            selected_local_path = local_path
+            break
+          else:
+            logs.append(
+                f"WARNING: Station {station_id} missing core weather columns"
+                " (TMP/DEW/WND). Bypassing..."
+            )
         elif response.status_code == 404:
           logs.append(
-              f"WARNING: Station {station_id} ({station_name}) not found in"
-              f" NOAA S3 archive for {target_year}. Bypassing..."
+              f"WARNING: Station {station_id} not found in NOAA S3 archive for"
+              f" {target_year}. Bypassing..."
           )
         else:
           logs.append(
@@ -222,7 +240,7 @@ class NOAA_WBGT_Fetcher:
     if not selected_local_path or not os.path.exists(selected_local_path):
       err_msg = (
           "CRITICAL ERROR: Unable to source dataset from NOAA S3 across all"
-          " nearby active stations."
+          " shortlisted stations."
       )
       logs.append(f"ERROR: {err_msg}")
       return None, err_msg, logs
@@ -245,12 +263,6 @@ class NOAA_WBGT_Fetcher:
     window_df = df[
         (df["DATE"] >= window_start) & (df["DATE"] < window_end)
     ].copy()
-
-    logs.append(
-        f"Filtered UTC time window ({window_start.strftime('%Y-%m-%d')} to"
-        f" {window_end.strftime('%Y-%m-%d')}): {len(window_df)} matching"
-        " records."
-    )
 
     if window_df.empty:
       err_msg = (
@@ -297,13 +309,6 @@ class NOAA_WBGT_Fetcher:
     tz_str = self.tz_finder.timezone_at(lng=target_lon, lat=target_lat)
     if not tz_str:
       tz_str = "UTC"
-      logs.append(
-          "Timezone warning: Could not resolve spatial timezone. Defaulting to"
-          " UTC."
-      )
-    else:
-      logs.append(f"Spatial Timezone Resolved: '{tz_str}'")
-
     local_tz = pytz.timezone(tz_str)
 
     final_df["Timestamp"] = pd.to_datetime(final_df["Timestamp"])
@@ -359,8 +364,8 @@ st.set_page_config(
 st.title("OSHA-WBGT Localized Weather Data Collector")
 st.markdown(
     "Retrieves, caches, and formats occupational weather data directly from"
-    " NOAA Open Data Dissemination (NODD) S3 feeds to be applied to compliance"
-    " reports."
+    " NOAA Open Data Dissemination (NODD) S3 feeds using optimized station"
+    " shortlisting."
 )
 
 st.sidebar.header("Exposure Parameters")
@@ -387,8 +392,8 @@ target_date = st.sidebar.date_input("Target Date", value=default_date)
 
 if st.sidebar.button("Fetch NOAA Data", type="primary"):
   with st.spinner(
-      "Connecting to NOAA NODD S3 feeds & evaluating active candidate"
-      " stations..."
+      "Querying master list, shortlisting airport stations, & fetching NOAA S3"
+      " archive..."
   ):
     fetcher = NOAA_WBGT_Fetcher()
     wbgt_data, message, logs = fetcher.get_hourly_data(
