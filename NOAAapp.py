@@ -145,7 +145,9 @@ class NOAA_WBGT_Fetcher:
       station_id = f"{usaf}-{wban}"
       station_name = str(row.get("STATION NAME", "UNKNOWN")).strip()
       dist_miles = row["DIST_MILES"]
-      file_name = f"{station_id}.csv"
+      
+      # NOAA S3 bucket concatenates USAF and WBAN with no hyphen separator
+      file_name = f"{usaf}{wban}.csv"
 
       # Implement year fallback check (Target Year and Target Year - 1)
       for search_year in [target_year, target_year - 1]:
