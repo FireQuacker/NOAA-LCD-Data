@@ -52,11 +52,12 @@ class NOAA_WBGT_Fetcher:
     return R * c
 
   def get_candidate_stations(
-      self, target_lat, target_lon, target_date_str, logs, max_candidates=20
+      self, target_lat, target_lon, target_date_str, logs, max_candidates=30
   ):
     """Retrieves master station history list, filters out inactive stations
 
-    based on target date, and ranks remaining candidates by distance.
+    based on target date, removes placeholder stations, and ranks remaining
+    candidates by distance.
     """
     logs.append(
         "Fetching NOAA master station history list (isd-history.csv)..."
@@ -83,6 +84,10 @@ class NOAA_WBGT_Fetcher:
     df = df.dropna(subset=["LAT", "LON"])
     df = df[(df["LAT"] != 0.0) | (df["LON"] != 0.0)].copy()
 
+    # Clean and parse USAF identifiers and filter out placeholder '999999' stations
+    df["USAF_CLEAN"] = df["USAF"].astype(str).str.strip().str.split(".").str[0].str.zfill(6)
+    df = df[df["USAF_CLEAN"] != "999999"].copy()
+
     # Clean and parse the END date column (Format: YYYYMMDD)
     df["END_CLEAN"] = pd.to_numeric(
         df["END"].astype(str).str[:8], errors="coerce"
@@ -97,13 +102,13 @@ class NOAA_WBGT_Fetcher:
     if active_stations.empty:
       logs.append(
           "WARNING: No strictly active stations found extending past target"
-          " date. Falling back to all historical station entries."
+          " date. Falling back to all historical non-placeholder station entries."
       )
       active_stations = df.copy()
 
     logs.append(
         "Evaluating distance across"
-        f" {len(active_stations)} candidate stations..."
+        f" {len(active_stations)} valid candidate stations..."
     )
     active_stations["DIST_MILES"] = active_stations.apply(
         lambda row: self._haversine_distance(
@@ -147,15 +152,9 @@ class NOAA_WBGT_Fetcher:
 
     # Fallback Loop: Iterate through candidates in order of proximity until a valid CSV is downloaded from AWS S3
     for _, row in candidates_df.iterrows():
-      raw_usaf = str(row["USAF"]).strip().split(".")[0]
+      usaf = row["USAF_CLEAN"]
       raw_wban = str(row["WBAN"]).strip().split(".")[0]
-
-      usaf = raw_usaf.zfill(6)
       wban = "99999" if raw_wban in ["", "nan", "99999"] else raw_wban.zfill(5)
-
-      # Skip placeholder IDs
-      if usaf == "999999" and wban == "99999":
-        continue
 
       station_id = f"{usaf}{wban}"
       station_name = str(row.get("STATION NAME", "UNKNOWN")).strip()
