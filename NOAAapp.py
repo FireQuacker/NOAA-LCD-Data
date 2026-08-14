@@ -218,7 +218,7 @@ class NOAA_WBGT_Fetcher:
     df.index = df.index.tz_localize("UTC").tz_convert(local_tz)
 
     local_date_str = target_date.strftime("%Y-%m-%d")
-    day_df = df[df.index.strftime("%Y-%m-%d"] == local_date_str].copy()
+    day_df = df[df.index.strftime("%Y-%m-%d") == local_date_str].copy()
 
     if day_df.empty:
       return (
