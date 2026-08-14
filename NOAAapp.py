@@ -127,10 +127,15 @@ class NOAA_WBGT_Fetcher:
       )
       radius_df = df.sort_values(by="DIST_MILES").head(15).copy()
 
-    radius_df["ICAO"] = radius_df["ICAO"].astype(str).str.strip()
-    radius_df["HAS_ICAO"] = radius_df["ICAO"].apply(
-        lambda x: 1 if x and x.upper() != "NAN" and len(x) >= 3 else 0
-    )
+    def _check_icao(val):
+      if val is None or pd.isna(val):
+        return 0
+      s = str(val).strip().upper()
+      if s in ["NAN", "NONE", "", "99999", "999999"]:
+        return 0
+      return 1 if len(s) >= 3 else 0
+
+    radius_df["HAS_ICAO"] = radius_df["ICAO"].apply(_check_icao)
 
     sorted_candidates = radius_df.sort_values(
         by=["HAS_ICAO", "DIST_MILES"], ascending=[False, True]
@@ -297,12 +302,10 @@ class NOAA_WBGT_Fetcher:
       ws_ms = _parse(row.get("WND"))
       slp_hpa = _parse(row.get("SLP"))
 
-      # 1. Convert Dry Bulb Temp from Celsius to Fahrenheit
       db_f = (
           round((db_c * 9.0 / 5.0) + 32.0, 1) if db_c is not None else None
       )
 
-      # 2. Calculate Relative Humidity (%) from Dry Bulb and Dew Point fallback
       rh = None
       if db_c is not None and dp_c is not None:
         rh = round(
@@ -314,10 +317,8 @@ class NOAA_WBGT_Fetcher:
             1,
         )
 
-      # 3. Derive Station Pressure (hPa) from Sea Level Pressure (SLP) using elevation
       station_pressure = None
       if slp_hpa is not None:
-        # Standard barometric reduction formula
         station_pressure = round(
             slp_hpa * (1 - (0.0065 * elevation_m) / 288.15) ** 5.255, 1
         )
