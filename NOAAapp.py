@@ -10,21 +10,17 @@ import requests
 import streamlit as st
 from timezonefinder import TimezoneFinder
 
-# Configure logger for backend processing tracking
+# Configure logger
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 class NOAA_WBGT_Fetcher:
-  """Standalone collector for NOAA Global Hourly (ISD) data.
-
-  Features auto-station discovery, multi-station fallback on 404 errors,
-  local caching, RH calculation, spatial timezone conversion, working-hour
-  filtering, and live execution logging.
-  """
+  """Localized weather collector using NOAA Open Data Dissemination (NODD) AWS S3 buckets with an automatic Open-Meteo API fallback."""
 
   def __init__(self, cache_dir="./noaa_cache"):
     self.cache_dir = cache_dir
-    self.noaa_bulk_url = "https://www.ncei.noaa.gov/data/global-hourly/access/"
+    # Public AWS S3 bucket endpoint under the NOAA Open Data Dissemination (NODD) initiative
+    self.s3_base_url = "https://noaa-global-hourly-pds.s3.amazonaws.com/"
     self.station_history_url = (
         "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv"
     )
@@ -34,18 +30,18 @@ class NOAA_WBGT_Fetcher:
     os.makedirs(self.cache_dir, exist_ok=True)
 
   def _haversine_distance(self, lat1, lon1, lat2, lon2):
-    """Calculates the great-circle distance between two points on Earth in miles."""
+    """Calculates great-circle distance between two GPS coordinates in miles."""
     lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
     a = (
         sin((lat2 - lat1) / 2) ** 2
         + cos(lat1) * cos(lat2) * sin((lon2 - lon1) / 2) ** 2
     )
-    return 2 * asin(sqrt(a)) * 6371 * 0.621371
+    return 2 * asin(sqrt(a)) * 3958.8
 
   def get_candidate_stations(
       self, target_lat, target_lon, target_year, logs, max_candidates=15
   ):
-    """Retrieves and ranks the closest NOAA candidate stations by Haversine distance."""
+    """Fetches master ISD history and ranks nearby stations by Haversine distance."""
     logs.append(
         "Fetching NOAA master station history list (isd-history.csv)..."
     )
@@ -63,28 +59,23 @@ class NOAA_WBGT_Fetcher:
       logs.append(f"ERROR: {err}")
       return None, err
 
-    # Clean numeric coordinate and date columns
     df["LAT"] = pd.to_numeric(df["LAT"], errors="coerce")
     df["LON"] = pd.to_numeric(df["LON"], errors="coerce")
     df["BEGIN"] = pd.to_numeric(df["BEGIN"], errors="coerce")
     df["END"] = pd.to_numeric(df["END"], errors="coerce")
 
     df = df.dropna(subset=["LAT", "LON"])
+    df = df[(df["LAT"] != 0.0) | (df["LON"] != 0.0)].copy()
 
-    target_start = int(f"{target_year}0101")
     target_end = int(f"{target_year}1231")
 
-    # Filter for active stations within target year window (allowing a 2-year index lag)
+    # Filter candidate stations active within window
     active_mask = (df["BEGIN"] <= target_end) & (
         df["END"] >= (target_year - 2) * 10000 + 101
     )
     active_stations = df[active_mask].copy()
 
     if active_stations.empty:
-      logs.append(
-          "WARNING: No strictly active stations found for target window."
-          f" Falling back to all historical stations prior to {target_year}."
-      )
       active_stations = df[df["BEGIN"] <= target_end].copy()
 
     if active_stations.empty:
@@ -106,21 +97,56 @@ class NOAA_WBGT_Fetcher:
         axis=1,
     )
 
-    # Sort stations strictly by distance ascending
     sorted_candidates = active_stations.sort_values(
         by="DIST_MILES"
     ).head(max_candidates)
     return sorted_candidates, None
 
-  def get_hourly_data(self, target_lat, target_lon, target_date_str):
-    """Retrieves, parses, and cleans hourly weather data.
+  def fetch_open_meteo_fallback(self, lat, lon, target_date_str, logs):
+    """Secondary engine to retrieve hourly weather data from Open-Meteo if NOAA stations fail."""
+    logs.append(
+        "ATTENTION: Initiating secondary fallback to Open-Meteo Reanalysis"
+        " API..."
+    )
+    try:
+      url = "https://archive-api.open-meteo.com/v1/archive"
+      params = {
+          "latitude": lat,
+          "longitude": lon,
+          "start_date": target_date_str,
+          "end_date": target_date_str,
+          "hourly": (
+              "temperature_2m,relative_humidity_2m,dew_point_2m,surface_pressure,wind_speed_10m"
+          ),
+          "timezone": "auto",
+      }
+      resp = self.session.get(url, params=params, timeout=20)
+      resp.raise_for_status()
+      data = resp.json()
 
-    Executes an iterative download loop over nearby candidate stations to
-    bypass missing files (404s).
-    Adjusts output to local time based on coordinates and filters for
-    08:00-17:00.
-    Returns (DataFrame or None, message string, list of execution logs).
-    """
+      if "hourly" in data and len(data["hourly"]["time"]) > 0:
+        h = data["hourly"]
+        df = pd.DataFrame({
+            "Timestamp": pd.to_datetime(h["time"]),
+            "Dry_Bulb_C": h["temperature_2m"],
+            "Relative_Humidity_Pct": h["relative_humidity_2m"],
+            "Wind_Speed_m_s": h["wind_speed_10m"],
+            "Station_Pressure_hPa": h["surface_pressure"],
+        })
+        logs.append(
+            "SUCCESS: Successfully retrieved hourly weather dataset via"
+            " Open-Meteo Fallback API."
+        )
+        return df
+      else:
+        logs.append("ERROR: Open-Meteo API returned an empty dataset.")
+        return None
+    except Exception as e:
+      logs.append(f"ERROR: Open-Meteo fallback failed: {e}")
+      return None
+
+  def get_hourly_data(self, target_lat, target_lon, target_date_str):
+    """Main workflow to pull station data from AWS S3, compute RH, localize time, and filter for daylight working hours."""
     logs = []
     target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
     target_year = target_date.year
@@ -134,92 +160,113 @@ class NOAA_WBGT_Fetcher:
     candidates_df, err = self.get_candidate_stations(
         target_lat, target_lon, target_year, logs
     )
-    if candidates_df is None or candidates_df.empty:
-      return None, err, logs
 
     selected_station_id = None
     selected_station_name = None
     selected_local_path = None
 
-    # Fallback Loop: Iterate through candidates in order of proximity until a valid CSV is downloaded
-    for _, row in candidates_df.iterrows():
-      raw_usaf = str(row["USAF"]).strip().split(".")[0]
-      raw_wban = str(row["WBAN"]).strip().split(".")[0]
+    if candidates_df is not None and not candidates_df.empty:
+      for _, row in candidates_df.iterrows():
+        raw_usaf = str(row["USAF"]).strip().split(".")[0]
+        raw_wban = str(row["WBAN"]).strip().split(".")[0]
 
-      usaf = raw_usaf.zfill(6)
-      wban = "99999" if raw_wban in ["", "nan", "99999"] else raw_wban.zfill(5)
-
-      station_id = f"{usaf}{wban}"
-      station_name = str(row.get("STATION NAME", "UNKNOWN")).strip()
-      dist_miles = row["DIST_MILES"]
-
-      file_name = f"{station_id}.csv"
-      local_path = os.path.join(self.cache_dir, f"{target_year}_{file_name}")
-
-      # Validate cache freshness
-      if os.path.exists(local_path):
-        file_mod_time = datetime.fromtimestamp(
-            os.path.getmtime(local_path)
-        ).date()
-        if target_date > file_mod_time:
-          logs.append(
-              f"Cache Notice ({station_id}): Target date is newer than local"
-              " cache modification time. Clearing local cache..."
-          )
-          os.remove(local_path)
-        else:
-          logs.append(
-              f"Cache Hit: Found valid cached dataset for '{station_name}'"
-              f" (ID: {station_id}) [{dist_miles:.2f} mi away]."
-          )
-          selected_station_id = station_id
-          selected_station_name = station_name
-          selected_local_path = local_path
-          break
-
-      # Attempt remote download if not cached
-      download_url = f"{self.noaa_bulk_url}{target_year}/{file_name}"
-      logs.append(
-          f"Testing station '{station_name}' (ID: {station_id}) [{dist_miles:.2f} mi away] -> {download_url}"
-      )
-
-      try:
-        response = self.session.get(download_url, timeout=20)
-        if response.status_code == 200:
-          with open(local_path, "wb") as out_file:
-            out_file.write(response.content)
-          logs.append(
-              f"SUCCESS: Connected and saved {len(response.content)} bytes from"
-              f" station '{station_name}' (ID: {station_id})."
-          )
-          selected_station_id = station_id
-          selected_station_name = station_name
-          selected_local_path = local_path
-          break
-        elif response.status_code == 404:
-          logs.append(
-              f"WARNING: Station {station_id} ({station_name}) returned 404"
-              " Not Found on NOAA server. Bypassing to next candidate..."
-          )
-        else:
-          logs.append(
-              f"WARNING: Station {station_id} returned HTTP status"
-              f" {response.status_code}. Trying next candidate..."
-          )
-      except Exception as e:
-        logs.append(
-            f"WARNING: Network error connecting to station {station_id}: {e}."
-            " Retrying next candidate..."
+        usaf = raw_usaf.zfill(6)
+        wban = (
+            "99999" if raw_wban in ["", "nan", "99999"] else raw_wban.zfill(5)
         )
 
+        station_id = f"{usaf}{wban}"
+        station_name = str(row.get("STATION NAME", "UNKNOWN")).strip()
+        dist_miles = row["DIST_MILES"]
+
+        file_name = f"{station_id}.csv"
+        local_path = os.path.join(
+            self.cache_dir, f"{target_year}_{file_name}"
+        )
+
+        # Cache check
+        if os.path.exists(local_path):
+          file_mod_time = datetime.fromtimestamp(
+              os.path.getmtime(local_path)
+          ).date()
+          if target_date > file_mod_time:
+            logs.append(
+                f"Cache Notice ({station_id}): Target date is newer than local"
+                " cache. Clearing cache..."
+            )
+            os.remove(local_path)
+          else:
+            logs.append(
+                f"Cache Hit: Found valid cached dataset for '{station_name}'"
+                f" (ID: {station_id}) [{dist_miles:.2f} mi away]."
+            )
+            selected_station_id = station_id
+            selected_station_name = station_name
+            selected_local_path = local_path
+            break
+
+        # Query NOAA Open Data Dissemination (AWS S3 Bucket)
+        download_url = f"{self.s3_base_url}{target_year}/{file_name}"
+        logs.append(
+            f"Testing station '{station_name}' (ID: {station_id}) [{dist_miles:.2f} mi away] -> {download_url}"
+        )
+
+        try:
+          response = self.session.get(download_url, timeout=20)
+          if response.status_code == 200 and len(response.content) > 100:
+            with open(local_path, "wb") as out_file:
+              out_file.write(response.content)
+            logs.append(
+                f"SUCCESS: Connected to NOAA S3 Storage and saved"
+                f" {len(response.content)} bytes for station '{station_name}'"
+                f" (ID: {station_id})."
+            )
+            selected_station_id = station_id
+            selected_station_name = station_name
+            selected_local_path = local_path
+            break
+          elif response.status_code == 404:
+            logs.append(
+                f"WARNING: Station {station_id} ({station_name}) not found in"
+                f" NOAA S3 archive for {target_year}. Bypassing..."
+            )
+          else:
+            logs.append(
+                f"WARNING: Station {station_id} returned HTTP status"
+                f" {response.status_code}. Bypassing..."
+            )
+        except Exception as e:
+          logs.append(
+              f"WARNING: Network error connecting to {station_id}: {e}."
+          )
+
+    # Execute Open-Meteo fallback if no NOAA station was reachable via S3
     if not selected_local_path or not os.path.exists(selected_local_path):
-      err_msg = (
-          "Failed to retrieve valid NOAA data from all nearby candidate"
+      logs.append(
+          "WARNING: Unable to source dataset from NOAA S3 across nearby"
           " stations."
       )
-      logs.append(f"ERROR: {err_msg}")
-      return None, err_msg, logs
+      fallback_df = self.fetch_open_meteo_fallback(
+          target_lat, target_lon, target_date_str, logs
+      )
+      if fallback_df is not None and not fallback_df.empty:
+        fallback_df.set_index("Timestamp", inplace=True)
+        final_df = fallback_df.between_time("08:00", "17:00")
+        return (
+            final_df,
+            "Extracted occupational weather exposure data via Open-Meteo"
+            " Fallback API.",
+            logs,
+        )
+      else:
+        err_msg = (
+            "Failed to retrieve weather data from both NOAA S3 storage and"
+            " Open-Meteo fallback."
+        )
+        logs.append(f"ERROR: {err_msg}")
+        return None, err_msg, logs
 
+    # Parse downloaded NOAA CSV file
     try:
       df = pd.read_csv(selected_local_path, low_memory=False)
       logs.append(
@@ -246,17 +293,22 @@ class NOAA_WBGT_Fetcher:
     )
 
     if window_df.empty:
-      warning = ""
-      if days_ago < 3:
-        warning = (
-            " Note: NOAA usually requires 48+ hours to quality-control and post"
-            " new data."
-        )
-      err_msg = (
-          f"No records found around {target_date_str} for station"
-          f" {selected_station_id}.{warning}"
+      logs.append(
+          f"WARNING: No matching records within date window for station {selected_station_id}. Attempting Open-Meteo fallback..."
       )
-      logs.append(f"WARNING: {err_msg}")
+      fallback_df = self.fetch_open_meteo_fallback(
+          target_lat, target_lon, target_date_str, logs
+      )
+      if fallback_df is not None and not fallback_df.empty:
+        fallback_df.set_index("Timestamp", inplace=True)
+        final_df = fallback_df.between_time("08:00", "17:00")
+        return (
+            final_df,
+            "Extracted occupational weather exposure data via Open-Meteo"
+            " Fallback API.",
+            logs,
+        )
+      err_msg = f"No weather records found for date {target_date_str}."
       return None, err_msg, logs
 
     def _parse(val, scale=10.0):
@@ -293,6 +345,7 @@ class NOAA_WBGT_Fetcher:
 
     final_df = pd.DataFrame(output)
 
+    # Spatial timezone localization
     tz_str = self.tz_finder.timezone_at(lng=target_lon, lat=target_lat)
     if not tz_str:
       tz_str = "UTC"
@@ -304,7 +357,6 @@ class NOAA_WBGT_Fetcher:
       logs.append(f"Spatial Timezone Resolved: '{tz_str}'")
 
     local_tz = pytz.timezone(tz_str)
-
     final_df["Timestamp"] = pd.to_datetime(final_df["Timestamp"])
     final_df.set_index("Timestamp", inplace=True)
     final_df.index = final_df.index.tz_localize("UTC").tz_convert(local_tz)
@@ -313,12 +365,27 @@ class NOAA_WBGT_Fetcher:
     try:
       final_df = final_df.loc[target_date_local]
     except KeyError:
-      err_msg = (
-          "Timezone shifting pushed all available records out of the requested"
-          " target date window."
+      logs.append(
+          "WARNING: Timezone shift pushed records outside single-day index."
+          " Falling back to Open-Meteo..."
       )
-      logs.append(f"ERROR: {err_msg}")
-      return None, err_msg, logs
+      fallback_df = self.fetch_open_meteo_fallback(
+          target_lat, target_lon, target_date_str, logs
+      )
+      if fallback_df is not None and not fallback_df.empty:
+        fallback_df.set_index("Timestamp", inplace=True)
+        final_df = fallback_df.between_time("08:00", "17:00")
+        return (
+            final_df,
+            "Extracted occupational weather exposure data via Open-Meteo"
+            " Fallback API.",
+            logs,
+        )
+      return (
+          None,
+          "Timezone localization alignment yielded no rows for requested date.",
+          logs,
+      )
 
     logs.append(
         "Filtering for local occupational daylight hours (08:00 - 17:00)..."
@@ -348,7 +415,7 @@ class NOAA_WBGT_Fetcher:
 
 
 # ==========================================
-# STREAMLIT USER INTERFACE (Root Execution)
+# STREAMLIT USER INTERFACE
 # ==========================================
 
 st.set_page_config(
@@ -358,7 +425,8 @@ st.set_page_config(
 st.title("OSHA-WBGT Localized Weather Data Collector")
 st.markdown(
     "Retrieves, caches, and formats occupational weather data directly from"
-    " NOAA ISD feeds to be applied to compliance reports."
+    " NOAA Open Data Dissemination (NODD) S3 storage with automatic"
+    " Open-Meteo fallback."
 )
 
 st.sidebar.header("Exposure Parameters")
@@ -385,19 +453,18 @@ target_date = st.sidebar.date_input("Target Date", value=default_date)
 
 if st.sidebar.button("Fetch NOAA Data", type="primary"):
   with st.spinner(
-      "Connecting to NOAA feeds & evaluating nearest active stations..."
+      "Connecting to NOAA NODD S3 feeds & evaluating candidate stations..."
   ):
     fetcher = NOAA_WBGT_Fetcher()
     wbgt_data, message, logs = fetcher.get_hourly_data(
         target_lat, target_lon, target_date.strftime("%Y-%m-%d")
     )
 
-    # Render Troubleshooting & Diagnostic Log Console
     with st.expander("🛠️ Execution Debug & Processing Log", expanded=True):
       for log in logs:
         if log.startswith("ERROR"):
           st.error(log)
-        elif log.startswith("WARNING"):
+        elif log.startswith("WARNING") or log.startswith("ATTENTION"):
           st.warning(log)
         elif log.startswith("SUCCESS"):
           st.success(log)
