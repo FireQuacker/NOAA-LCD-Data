@@ -1,25 +1,19 @@
-from datetime import datetime, timedelta
-from io import StringIO
+
+import pandas as pd
+import requests
 import logging
 import math
 import os
-import numpy as np
-import pandas as pd
+from io import StringIO
+from datetime import datetime, timedelta
 import pytz
-import requests
-import streamlit as st
 from timezonefinder import TimezoneFinder
-
-# Configure logger for backend processing tracking
-logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 
 class NOAA_WBGT_Fetcher:
   """Optimized multi-step collector for NOAA Global Hourly (ISD) data using
-
-  NOAA Open Data Dissemination (NODD) AWS S3 buckets. Automatically fetches GPS
-  elevation, computes station pressure from sea level pressure, converts dry
-  bulb to Fahrenheit, and calculates relative humidity from dew point.
+  NOAA Open Data Dissemination (NODD) AWS S3 buckets. Includes robust station
+  finding, data validation, and local timezone-aware filtering.
   """
 
   def __init__(self, cache_dir="./noaa_cache"):
@@ -30,24 +24,20 @@ class NOAA_WBGT_Fetcher:
     )
     self.elevation_api_url = "https://api.open-meteo.com/v1/elevation"
     self.session = requests.Session()
-    self.session.headers.update({"User-Agent": "OSHA-WBGT-Tool"})
+    self.session.headers.update({"User-Agent": "OSHA-WBGT-Tool/1.1"})
     self.tz_finder = TimezoneFinder()
     os.makedirs(self.cache_dir, exist_ok=True)
 
   def _haversine_distance(self, lat1, lon1, lat2, lon2):
     """Calculates the great-circle distance between two points on Earth in miles."""
-    R = 3959.0
+    R = 3959.0  # Earth radius in miles
     lat1_rad, lon1_rad = math.radians(lat1), math.radians(lon1)
     lat2_rad, lon2_rad = math.radians(lat2), math.radians(lon2)
-
-    dlat = lat2_rad - lat1_rad
     dlon = lon2_rad - lon1_rad
-
+    dlat = lat2_rad - lat1_rad
     a = (
         math.sin(dlat / 2) ** 2
-        + math.cos(lat1_rad)
-        * math.cos(lat2_rad)
-        * math.sin(dlon / 2) ** 2
+        + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(dlon / 2) ** 2
     )
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
@@ -64,390 +54,181 @@ class NOAA_WBGT_Fetcher:
         data = response.json()
         elevation = data.get("elevation", [0.0])[0]
         logs.append(
-            f"Fetched GPS Elevation: {elevation:.1f} meters"
-            f" ({elevation * 3.28084:.1f} ft)."
+            f"Fetched GPS Elevation: {elevation:.1f} meters ({elevation * 3.28084:.1f} ft)."
         )
         return float(elevation)
     except Exception as e:
       logs.append(
-          f"WARNING: Could not fetch elevation from API ({e}). Defaulting to"
-          " 0.0m."
+          f"WARNING: Could not fetch elevation from API ({e}). Defaulting to 0.0m."
       )
     return 0.0
 
-  def get_filtered_candidate_stations(
-      self, target_lat, target_lon, target_date_str, logs, max_radius_miles=50.0
-  ):
-    """Fetches master station list, filters by radius, and prioritizes ICAO airport stations."""
-    logs.append(
-        "Step 1: Fetching NOAA master station history list (isd-history.csv)..."
-    )
+  def get_candidate_stations(self, target_lat, target_lon, logs, max_radius_miles=50.0):
+    """Fetches and filters the master station list, prioritizing ICAO airport stations."""
+    logs.append("Step 1: Fetching NOAA master station history list (isd-history.csv)...")
     try:
       response = self.session.get(self.station_history_url, timeout=30)
       response.raise_for_status()
       df = pd.read_csv(
-          StringIO(response.text),
-          dtype={"USAF": str, "WBAN": str},
-          low_memory=False,
+          StringIO(response.text), dtype={"USAF": str, "WBAN": str}, low_memory=False
       )
-      logs.append(
-          f"Successfully retrieved master station list ({len(df)} entries)."
-      )
+      logs.append(f"Successfully retrieved master station list ({len(df)} entries).")
     except Exception as e:
-      err = f"Failed to fetch station list from NOAA: {e}"
+      err = f"CRITICAL: Failed to fetch station list from NOAA: {e}"
       logs.append(f"ERROR: {err}")
       return None, err
 
     df["LAT"] = pd.to_numeric(df["LAT"], errors="coerce")
     df["LON"] = pd.to_numeric(df["LON"], errors="coerce")
-    df = df.dropna(subset=["LAT", "LON"])
+    df.dropna(subset=["LAT", "LON"], inplace=True)
     df = df[(df["LAT"] != 0.0) | (df["LON"] != 0.0)].copy()
 
-    df["USAF_CLEAN"] = (
-        df["USAF"].astype(str).str.strip().str.split(".").str[0].str.zfill(6)
-    )
-    df = df[df["USAF_CLEAN"] != "999999"].copy()
-
-    logs.append(
-        f"Step 2: Calculating distances and filtering stations within"
-        f" {max_radius_miles} miles..."
-    )
     df["DIST_MILES"] = df.apply(
-        lambda row: self._haversine_distance(
-            target_lat, target_lon, row["LAT"], row["LON"]
-        ),
+        lambda row: self._haversine_distance(target_lat, target_lon, row["LAT"], row["LON"]),
         axis=1,
     )
 
-    radius_df = df[df["DIST_MILES"] <= max_radius_miles].copy()
-    if radius_df.empty:
-      logs.append(
-          "WARNING: No stations found within strict radius. Expanding search"
-          " to 15 closest global stations..."
-      )
-      radius_df = df.sort_values(by="DIST_MILES").head(15).copy()
+    candidates = df[df["DIST_MILES"] <= max_radius_miles].copy()
+    if len(candidates) < 10:
+      logs.append(f"INFO: Found only {len(candidates)} stations within radius. Expanding search to 15 closest globally.")
+      candidates = df.sort_values(by="DIST_MILES").head(15).copy()
 
-    def _check_icao(val):
-      if val is None or pd.isna(val):
-        return 0
-      s = str(val).strip().upper()
-      if s in ["NAN", "NONE", "", "99999", "999999"]:
-        return 0
-      return 1 if len(s) >= 3 else 0
-
-    radius_df["HAS_ICAO"] = radius_df["ICAO"].apply(_check_icao)
-
-    sorted_candidates = radius_df.sort_values(
+    candidates["HAS_ICAO"] = candidates["ICAO"].apply(
+        lambda x: 1 if pd.notna(x) and len(str(x).strip()) >= 3 else 0
+    )
+    sorted_candidates = candidates.sort_values(
         by=["HAS_ICAO", "DIST_MILES"], ascending=[False, True]
     ).reset_index(drop=True)
-
-    logs.append(
-        f"Shortlisted {len(sorted_candidates)} viable stations near target"
-        " coordinates (ICAO airport stations prioritized)."
-    )
+    
+    logs.append(f"Step 2: Shortlisted {len(sorted_candidates)} viable stations (ICAO airport stations prioritized).")
     return sorted_candidates, None
 
-  def get_hourly_data(self, target_lat, target_lon, target_date_str):
-    """Iteratively queries NOAA S3 storage, extracts exact variables, and applies local conversions."""
-    logs = []
-    target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
-    target_year = target_date.year
-    days_ago = (datetime.now().date() - target_date).days
+  def find_and_download_data(self, candidates_df, target_date, logs):
+      """Iteratively tests candidate stations to find and download a valid dataset."""
+      logs.append("Step 3: Iterating through station shortlist to find a valid dataset in NOAA's S3 archive...")
+      target_year = target_date.year
 
-    logs.append(
-        f"Target Parameters -> Lat: {target_lat:.4f}, Lon:"
-        f" {target_lon:.4f}, Date: {target_date_str} ({days_ago} days ago)"
-    )
+      for _, row in candidates_df.iterrows():
+          usaf = str(row.get("USAF", "")).strip()
+          wban = str(row.get("WBAN", "")).strip()
+          station_id = f"{usaf}-{wban}"
+          station_name = str(row.get("STATION NAME", "UNKNOWN")).strip()
+          dist_miles = row["DIST_MILES"]
+          
+          # Skip stations with invalid identifiers
+          if usaf == '999999' or wban == '99999':
+              continue
 
-    elevation_m = self.get_elevation(target_lat, target_lon, logs)
+          file_name = f"{usaf}-{wban}.csv"
+          local_path = os.path.join(self.cache_dir, f"{target_year}_{file_name}")
 
-    candidates_df, err = self.get_filtered_candidate_stations(
-        target_lat, target_lon, target_date_str, logs
-    )
-    if candidates_df is None or candidates_df.empty:
-      return None, err, logs
+          if os.path.exists(local_path):
+              logs.append(f"Cache Hit: Using existing local data for station '{station_name}' [{dist_miles:.1f} mi].")
+              return local_path, station_name, station_id
+          
+          download_url = f"{self.s3_base_url}{target_year}/{file_name}"
+          logs.append(f"Testing: '{station_name}' [{dist_miles:.1f} mi] -> {download_url}")
+          
+          try:
+              response = self.session.head(download_url, timeout=10) # Use HEAD request for quick check
+              if response.status_code == 200 and int(response.headers.get('Content-Length', 0)) > 1024:
+                  logs.append(f"SUCCESS: Station '{station_name}' has a valid data file. Proceeding with full download.")
+                  full_response = self.session.get(download_url, timeout=30)
+                  full_response.raise_for_status()
+                  with open(local_path, "wb") as out_file:
+                      out_file.write(full_response.content)
+                  return local_path, station_name, station_id
+              else:
+                  logs.append(f"INFO: No valid data file found for station '{station_name}' for {target_year}.")
+          except Exception as e:
+              logs.append(f"WARNING: Network error checking station {station_id}: {e}")
+              
+      return None, None, None
 
-    selected_station_id = None
-    selected_station_name = None
-    selected_local_path = None
 
-    logs.append(
-        "Step 3: Iterating through prioritized station shortlist to test NOAA"
-        " S3 archive availability..."
-    )
-
-    for _, row in candidates_df.iterrows():
-      usaf = row["USAF_CLEAN"]
-      raw_wban = str(row["WBAN"]).strip().split(".")[0]
-      wban = "99999" if raw_wban in ["", "nan", "99999"] else raw_wban.zfill(5)
-
-      station_id = f"{usaf}{wban}"
-      station_name = str(row.get("STATION NAME", "UNKNOWN")).strip()
-      icao_code = str(row.get("ICAO", ""))
-      dist_miles = row["DIST_MILES"]
-
-      file_name = f"{station_id}.csv"
-      local_path = os.path.join(self.cache_dir, f"{target_year}_{file_name}")
-
-      if os.path.exists(local_path):
-        file_mod_time = datetime.fromtimestamp(
-            os.path.getmtime(local_path)
-        ).date()
-        if target_date > file_mod_time:
-          os.remove(local_path)
-        else:
-          logs.append(
-              f"Cache Hit: Found valid cached dataset for '{station_name}'"
-              f" (ID: {station_id}, ICAO: {icao_code}) [{dist_miles:.2f} mi"
-              " away]."
-          )
-          selected_station_id = station_id
-          selected_station_name = station_name
-          selected_local_path = local_path
-          break
-
-      download_url = f"{self.s3_base_url}{target_year}/{file_name}"
-      logs.append(
-          f"Testing station '{station_name}' (ID: {station_id}, ICAO:"
-          f" {icao_code}) [{dist_miles:.2f} mi away] -> {download_url}"
-      )
-
+  def process_datafile(self, local_path, station_name, station_id, target_date, target_lat, target_lon, elevation_m, logs):
+      """Parses the downloaded CSV, applies conversions, and filters to the target date and time."""
+      logs.append(f"Step 4: Parsing and cleaning data from station '{station_name}'...")
       try:
-        response = self.session.get(download_url, timeout=20)
-        if response.status_code == 200 and len(response.content) > 100:
-          sample_df = pd.read_csv(
-              StringIO(response.text), nrows=5, low_memory=False
-          )
-          if (
-              "TMP" in sample_df.columns
-              and "DEW" in sample_df.columns
-              and "WND" in sample_df.columns
-          ):
-            with open(local_path, "wb") as out_file:
-              out_file.write(response.content)
-            logs.append(
-                f"SUCCESS: Validated and downloaded {len(response.content)}"
-                f" bytes for station '{station_name}' (ID: {station_id})."
-            )
-            selected_station_id = station_id
-            selected_station_name = station_name
-            selected_local_path = local_path
-            break
-          else:
-            logs.append(
-                f"WARNING: Station {station_id} missing core weather columns"
-                " (TMP/DEW/WND). Bypassing..."
-            )
-        elif response.status_code == 404:
-          logs.append(
-              f"WARNING: Station {station_id} not found in NOAA S3 archive for"
-              f" {target_year}. Bypassing..."
-          )
-        else:
-          logs.append(
-              f"WARNING: Station {station_id} returned HTTP status"
-              f" {response.status_code}. Bypassing..."
-          )
+          df = pd.read_csv(local_path, low_memory=False)
+          df["DATE"] = pd.to_datetime(df["DATE"])
       except Exception as e:
-        logs.append(
-            f"WARNING: Network error connecting to station {station_id}: {e}."
-        )
+          return None, f"Error parsing CSV file for station {station_id}: {e}"
 
-    if not selected_local_path or not os.path.exists(selected_local_path):
-      err_msg = (
-          "CRITICAL ERROR: Unable to source dataset from NOAA S3 across all"
-          " shortlisted stations."
-      )
-      logs.append(f"ERROR: {err_msg}")
-      return None, err_msg, logs
+      # Determine local timezone
+      tz_str = self.tz_finder.timezone_at(lng=target_lon, lat=target_lat) or "UTC"
+      local_tz = pytz.timezone(tz_str)
+      logs.append(f"INFO: Target coordinates fall in timezone: {tz_str}")
 
-    try:
-      df = pd.read_csv(selected_local_path, low_memory=False)
-      logs.append(
-          f"Parsed CSV file for station {selected_station_id} successfully"
-          f" ({len(df)} total hourly rows)."
-      )
-    except Exception as e:
-      err_msg = f"Error parsing CSV data for station {selected_station_id}: {e}"
-      logs.append(f"ERROR: {err_msg}")
-      return None, err_msg, logs
+      df.set_index("DATE", inplace=True)
+      df.index = df.index.tz_localize("UTC").tz_convert(local_tz)
 
-    df["DATE"] = pd.to_datetime(df["DATE"])
+      # Filter by local date
+      local_date_str = target_date.strftime("%Y-%m-%d")
+      day_df = df[df.index.strftime("%Y-%m-%d") == local_date_str].copy()
 
-    window_start = pd.to_datetime(target_date_str) - timedelta(days=1)
-    window_end = pd.to_datetime(target_date_str) + timedelta(days=2)
-    window_df = df[
-        (df["DATE"] >= window_start) & (df["DATE"] < window_end)
-    ].copy()
+      if day_df.empty:
+          return None, f"No records found for the local date {local_date_str} at this station."
 
-    if window_df.empty:
-      err_msg = (
-          f"No records found around {target_date_str} for station"
-          f" {selected_station_id}."
-      )
-      logs.append(f"WARNING: {err_msg}")
-      return None, err_msg, logs
+      def _parse(val, scale=10.0):
+        try:
+            # Handle format like "123,1" -> 123
+            v = float(str(val).split(",")[0])
+            # NOAA uses 999, 9999 etc for missing values
+            return None if v > 9990 else v / scale
+        except (ValueError, TypeError):
+            return None
 
-    def _parse(val, scale=10.0):
-      try:
-        v = float(str(val).split(",")[0])
-        return None if v == 9999 else v / scale
-      except:
-        return None
+      output = []
+      for ts, row in day_df.iterrows():
+          db_c = _parse(row.get("TMP"))
+          dp_c = _parse(row.get("DEW"))
+          ws_ms = _parse(row.get("WND"))
+          slp_hpa = _parse(row.get("SLP"))
 
-    output = []
-    for _, row in window_df.iterrows():
-      db_c = _parse(row.get("TMP"))
-      dp_c = _parse(row.get("DEW"))
-      ws_ms = _parse(row.get("WND"))
-      slp_hpa = _parse(row.get("SLP"))
+          rh, station_pressure = None, None
+          db_f = (db_c * 9/5 + 32) if db_c is not None else None
+          if db_c is not None and dp_c is not None:
+              es = 6.112 * math.exp((17.67 * dp_c) / (dp_c + 243.5))
+              e = 6.112 * math.exp((17.67 * db_c) / (db_c + 243.5))
+              rh = (es / e) * 100
+          if slp_hpa is not None and elevation_m is not None:
+              station_pressure = slp_hpa * math.pow(1 - (0.0065 * elevation_m) / (slp_hpa/3.48 + 273.15), 5.255)
 
-      db_f = (
-          round((db_c * 9.0 / 5.0) + 32.0, 1) if db_c is not None else None
-      )
+          output.append({
+              "Timestamp_Local": ts, "Dry_Bulb_F": round(db_f,1) if db_f else None,
+              "Relative_Humidity_Pct": round(rh,1) if rh else None, "Wind_Speed_10m_ms": ws_ms,
+              "Station_Pressure_hPa": round(station_pressure,1) if station_pressure else None
+          })
 
-      rh = None
-      if db_c is not None and dp_c is not None:
-        rh = round(
-            100
-            * (
-                10 ** ((7.5 * dp_c) / (237.3 + dp_c))
-                / 10 ** ((7.5 * db_c) / (237.3 + db_c))
-            ),
-            1,
-        )
+      final_df = pd.DataFrame(output).set_index("Timestamp_Local")
+      
+      # Filter for occupational hours
+      final_df = final_df.between_time("08:00", "17:00")
+      if final_df.empty:
+          return None, "No data available during daylight working hours (08:00 - 17:00)."
 
-      station_pressure = None
-      if slp_hpa is not None:
-        station_pressure = round(
-            slp_hpa * (1 - (0.0065 * elevation_m) / 288.15) ** 5.255, 1
-        )
+      logs.append(f"SUCCESS: Extracted {len(final_df)} hourly records for {local_date_str}.")
+      return final_df, f"Successfully processed data from station '{station_name}'."
+  
+  def get_hourly_data(self, target_lat, target_lon, target_date_str):
+      """Main entrypoint to orchestrate the data fetching and processing pipeline."""
+      logs = []
+      target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+      
+      logs.append(f"Target -> Lat: {target_lat:.4f}, Lon: {target_lon:.4f}, Date: {target_date_str}")
+      
+      elevation_m = self.get_elevation(target_lat, target_lon, logs)
+      
+      candidates_df, err = self.get_candidate_stations(target_lat, target_lon, logs)
+      if err: return None, err, logs
 
-      output.append({
-          "Timestamp": row["DATE"],
-          "Dry_Bulb_F": db_f,
-          "Relative_Humidity_Pct": rh,
-          "Wind_Speed_10m_ms": ws_ms,
-          "Station_Pressure_hPa": station_pressure,
-      })
+      local_path, station_name, station_id = self.find_and_download_data(candidates_df, target_date, logs)
+      if not local_path:
+          err_msg = "CRITICAL: Unable to find a usable dataset from any nearby station in the NOAA S3 archive."
+          logs.append(f"ERROR: {err_msg}")
+          return None, err_msg, logs
 
-    final_df = pd.DataFrame(output)
-
-    tz_str = self.tz_finder.timezone_at(lng=target_lon, lat=target_lat)
-    if not tz_str:
-      tz_str = "UTC"
-    local_tz = pytz.timezone(tz_str)
-
-    final_df["Timestamp"] = pd.to_datetime(final_df["Timestamp"])
-    final_df.set_index("Timestamp", inplace=True)
-    final_df.index = final_df.index.tz_localize("UTC").tz_convert(local_tz)
-
-    target_date_local = target_date.strftime("%Y-%m-%d")
-    try:
-      final_df = final_df.loc[target_date_local]
-    except KeyError:
-      err_msg = (
-          "Timezone shifting pushed all available records out of the requested"
-          " target date window."
-      )
-      logs.append(f"ERROR: {err_msg}")
-      return None, err_msg, logs
-
-    logs.append(
-        "Filtering for local occupational daylight hours (08:00 - 17:00)..."
-    )
-    final_df = final_df.between_time("08:00", "17:00")
-
-    if final_df.empty:
-      err_msg = (
-          "No data available during daylight working hours (08:00 - 17:00)"
-          " for this specific date."
-      )
-      logs.append(f"WARNING: {err_msg}")
-      return None, err_msg, logs
-
-    logs.append(
-        f"SUCCESS: Extracted {len(final_df)} hourly exposure records from station"
-        f" '{selected_station_name}' ({selected_station_id}) for"
-        f" {target_date_local}."
-    )
-    return (
-        final_df,
-        f"Successfully extracted variables from station '{selected_station_name}'"
-        f" (ID: {selected_station_id}, Elevation: {elevation_m}m).",
-        logs,
-    )
-
-
-# ==========================================
-# STREAMLIT USER INTERFACE (Root Execution)
-# ==========================================
-
-st.set_page_config(
-    page_title="OSHA-WBGT NOAA Fetcher", page_icon="🌤️", layout="wide"
-)
-
-st.title("OSHA-WBGT Localized Weather Data Collector")
-st.markdown(
-    "Extracts Dry Bulb (°F), Relative Humidity (%), Wind Speed 10m (m/s), and"
-    " Station Pressure (hPa) directly from NOAA S3 feeds."
-)
-
-st.sidebar.header("Exposure Parameters")
-
-target_lat = st.sidebar.number_input(
-    "Latitude",
-    min_value=-90.0,
-    max_value=90.0,
-    value=38.5500,
-    step=0.0001,
-    format="%.4f",
-)
-target_lon = st.sidebar.number_input(
-    "Longitude",
-    min_value=-180.0,
-    max_value=180.0,
-    value=-77.5700,
-    step=0.0001,
-    format="%.4f",
-)
-
-default_date = datetime.now() - timedelta(days=5)
-target_date = st.sidebar.date_input("Target Date", value=default_date)
-
-if st.sidebar.button("Fetch NOAA Data", type="primary"):
-  with st.spinner("Querying elevation, stations, & fetching NOAA S3 archive..."):
-    fetcher = NOAA_WBGT_Fetcher()
-    wbgt_data, message, logs = fetcher.get_hourly_data(
-        target_lat, target_lon, target_date.strftime("%Y-%m-%d")
-    )
-
-    with st.expander("🛠️ Execution Debug & Processing Log", expanded=True):
-      for log in logs:
-        if log.startswith("ERROR"):
-          st.error(log)
-        elif log.startswith("WARNING"):
-          st.warning(log)
-        elif log.startswith("SUCCESS"):
-          st.success(log)
-        else:
-          st.text(f"• {log}")
-
-    if wbgt_data is not None:
-      st.success(message)
-      st.dataframe(wbgt_data, use_container_width=True)
-
-      csv = wbgt_data.to_csv()
-      st.download_button(
-          label="Download Exposure Data (CSV)",
-          data=csv,
-          file_name=f"NOAA_WBGT_Extract_{target_date}.csv",
-          mime="text/csv",
-      )
-    else:
-      st.error(message)
-else:
-  st.info(
-      "Adjust GPS coordinates and target date in the sidebar, then click 'Fetch"
-      " NOAA Data'."
-  )
+      final_df, msg = self.process_datafile(local_path, station_name, station_id, target_date, target_lat, target_lon, elevation_m, logs)
+      
+      return final_df, msg, logs
