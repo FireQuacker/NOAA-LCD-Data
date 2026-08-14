@@ -7,7 +7,9 @@ from datetime import datetime, timedelta
 from math import radians, cos, sin, asin, sqrt
 from timezonefinder import TimezoneFinder
 import pytz
+import streamlit as st
 
+# Configure logger for backend processing tracking
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
 class NOAA_WBGT_Fetcher:
@@ -29,15 +31,13 @@ class NOAA_WBGT_Fetcher:
         """Calculates the great-circle distance between two points on the Earth surface."""
         lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
         a = sin((lat2 - lat1)/2)**2 + cos(lat1) * cos(lat2) * sin((lon2 - lon1)/2)**2
-        return 2 * asin(sqrt(a)) * 6371 * 0.621371 # Returns distance in miles
+        return 2 * asin(sqrt(a)) * 6371 * 0.621371
 
     def get_nearest_station(self, target_lat, target_lon, target_year):
         """Locates the closest active NOAA station to the provided coordinates."""
-        logging.info("Fetching NOAA master station history list...")
         try:
             response = self.session.get(self.station_history_url, timeout=30)
             response.raise_for_status()
-            # Read CSV from string response
             from io import StringIO
             df = pd.read_csv(StringIO(response.text), dtype={'USAF': str, 'WBAN': str})
         except Exception as e:
@@ -54,7 +54,6 @@ class NOAA_WBGT_Fetcher:
         active_stations = df[(df['BEGIN'] <= target_end) & (df['END'] >= target_start)].copy()
         
         if active_stations.empty: 
-            logging.error("No active stations found for the target year.")
             return None
 
         active_stations['DIST_MILES'] = active_stations.apply(
@@ -64,7 +63,6 @@ class NOAA_WBGT_Fetcher:
         closest = active_stations.loc[active_stations['DIST_MILES'].idxmin()]
         wban = '99999' if pd.isna(closest['WBAN']) or closest['WBAN'] == '' else closest['WBAN']
         
-        logging.info(f"Nearest Active Station: {closest['STATION NAME']} ({closest['DIST_MILES']:.1f} miles away)")
         return f"{closest['USAF']}{wban}"
 
     def get_hourly_data(self, target_lat, target_lon, target_date_str):
@@ -72,31 +70,21 @@ class NOAA_WBGT_Fetcher:
         Retrieves, parses, and cleans hourly weather data. 
         Adjusts to local time based on coordinates and filters for 08:00-17:00.
         """
-        # Safety Check for 48-Hour Lag
         target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
         target_year = target_date.year
         days_ago = (datetime.now().date() - target_date).days
         
-        if days_ago < 3:
-            logging.warning(f"⚠️ DATE TOO RECENT: {target_date_str} is only {days_ago} days ago.")
-            logging.warning("NOAA takes 48+ hours to quality-control and post hourly data. This pull may return empty.")
-
-        # Find Nearest Station
         station_id = self.get_nearest_station(target_lat, target_lon, target_year)
         if not station_id: 
-            return None
+            return None, "No active weather station found for this year and location."
 
-        # Download/Cache File
         file_name = f"{station_id}.csv"
         local_path = os.path.join(self.cache_dir, f"{target_year}_{file_name}")
         
         if os.path.exists(local_path):
             file_mod_time = datetime.fromtimestamp(os.path.getmtime(local_path)).date()
             if target_date > file_mod_time:
-                logging.info("Cached file is older than target date. Redownloading updated NOAA file...")
                 os.remove(local_path)
-            else:
-                logging.info("Using valid cached NOAA data.")
         
         if not os.path.exists(local_path):
             download_url = f"{self.noaa_bulk_url}{target_year}/{file_name}"
@@ -106,25 +94,26 @@ class NOAA_WBGT_Fetcher:
                 with open(local_path, 'wb') as out_file:
                     out_file.write(response.content)
             except Exception as e:
-                logging.error(f"Failed to download data for station {station_id}: {e}")
-                return None
+                return None, f"Failed to download NOAA file for station {station_id}: {e}"
 
-        # Extract and Clean Variables
-        df = pd.read_csv(local_path, low_memory=False)
+        try:
+            df = pd.read_csv(local_path, low_memory=False)
+        except Exception as e:
+            return None, f"Error parsing downloaded CSV data: {e}"
+
         df['DATE'] = pd.to_datetime(df['DATE'])
         
-        # We cannot filter by exact date yet because NOAA is in UTC. 
-        # We must pull a slightly wider window, convert timezones, then filter.
         window_start = pd.to_datetime(target_date_str) - timedelta(days=1)
         window_end = pd.to_datetime(target_date_str) + timedelta(days=2)
         window_df = df[(df['DATE'] >= window_start) & (df['DATE'] < window_end)].copy()
         
         if window_df.empty:
-            logging.error(f"No records found around {target_date_str}. NOAA may still be processing.")
-            return None
+            warning = ""
+            if days_ago < 3:
+                warning = " Note: NOAA usually requires 48+ hours to quality-control and post new data."
+            return None, f"No records found around {target_date_str}.{warning}"
 
         def _parse(val, scale=10.0):
-            """Parses the NOAA scaled string formats, returning None for missing data (9999)."""
             try:
                 v = float(str(val).split(',')[0])
                 return None if v == 9999 else v / scale
@@ -139,7 +128,6 @@ class NOAA_WBGT_Fetcher:
             
             rh = None
             if db is not None and dp is not None:
-                # Clausius-Clapeyron approx for Relative Humidity
                 rh = round(100 * (10 ** ((7.5 * dp) / (237.3 + dp)) / 10 ** ((7.5 * db) / (237.3 + db))), 1)
 
             output.append({
@@ -152,46 +140,64 @@ class NOAA_WBGT_Fetcher:
 
         final_df = pd.DataFrame(output)
         
-        # Determine Local Timezone from Coordinates
         tz_str = self.tz_finder.timezone_at(lng=target_lon, lat=target_lat)
         if not tz_str:
-            logging.warning("Could not determine local timezone. Defaulting to UTC.")
             tz_str = "UTC"
-        else:
-            logging.info(f"Localized coordinates to timezone: {tz_str}")
 
         local_tz = pytz.timezone(tz_str)
         
-        # Apply Timezone Conversions
         final_df['Timestamp'] = pd.to_datetime(final_df['Timestamp'])
         final_df.set_index('Timestamp', inplace=True)
         final_df.index = final_df.index.tz_localize('UTC').tz_convert(local_tz)
 
-        # Filter strictly to the target date requested, post-timezone conversion
         target_date_local = target_date.strftime('%Y-%m-%d')
-        final_df = final_df.loc[target_date_local]
+        try:
+            final_df = final_df.loc[target_date_local]
+            final_df = final_df.between_time('08:00', '17:00')
+        except KeyError:
+             return None, "Timezone shifting pushed all records out of the requested target date window."
+
+        if final_df.empty:
+             return None, "No data available during daylight working hours (08:00 - 17:00) for this specific date."
+
+        return final_df, f"Success! Data mapped and localized to timezone: {tz_str}."
+
+
+# ==========================================
+# STREAMLIT USER INTERFACE (Root Execution)
+# ==========================================
+
+st.set_page_config(page_title="OSHA-WBGT NOAA Fetcher", page_icon="🌤️", layout="wide")
+
+st.title("OSHA-WBGT Localized Weather Data Collector")
+st.markdown("Retrieves, caches, and formats occupational weather data directly from NOAA ISD feeds to be applied to compliance reports.")
+
+st.sidebar.header("Exposure Parameters")
+
+target_lat = st.sidebar.number_input("Latitude", min_value=-90.0, max_value=90.0, value=36.718, step=0.001)
+target_lon = st.sidebar.number_input("Longitude", min_value=-180.0, max_value=180.0, value=-76.246, step=0.001)
+
+# Defaults to 5 days ago to accommodate for NOAA's data processing lag period
+default_date = datetime.now() - timedelta(days=5)
+target_date = st.sidebar.date_input("Target Date", value=default_date)
+
+if st.sidebar.button("Fetch NOAA Data", type="primary"):
+    with st.spinner("Connecting to NOAA feeds & calculating nearest active station..."):
+        fetcher = NOAA_WBGT_Fetcher()
+        wbgt_data, message = fetcher.get_hourly_data(target_lat, target_lon, target_date.strftime("%Y-%m-%d"))
         
-        # Filter strictly for occupational daylight working hours (08:00 - 17:00)
-        final_df = final_df.between_time('08:00', '17:00')
-
-        return final_df
-
-if __name__ == "__main__":
-    fetcher = NOAA_WBGT_Fetcher()
-    
-    # Test execution for a regional location (Chesapeake, VA)
-    TEST_LAT = 36.718
-    TEST_LON = -76.246
-    
-    # Utilizing a date far enough in the past to ensure NOAA has processed the 48-hour lag
-    test_date = (datetime.now() - timedelta(days=5)).strftime("%Y-%m-%d")
-    
-    print(f"Starting NOAA Data Pull for GPS({TEST_LAT}, {TEST_LON}) on {test_date}...\n")
-    
-    wbgt_data = fetcher.get_hourly_data(TEST_LAT, TEST_LON, test_date)
-    
-    if wbgt_data is not None and not wbgt_data.empty:
-        print("\nSUCCESS! Parsed, localized, and filtered dataset ready for the OSHA Calculator:")
-        print(wbgt_data)
-    else:
-        print("\nFailed to retrieve or filter valid data for this period.")
+        if wbgt_data is not None:
+            st.success(message)
+            st.dataframe(wbgt_data, use_container_width=True)
+            
+            csv = wbgt_data.to_csv()
+            st.download_button(
+                label="Download Exposure Data (CSV)",
+                data=csv,
+                file_name=f"NOAA_WBGT_Extract_{target_date}.csv",
+                mime="text/csv",
+            )
+        else:
+            st.error(message)
+else:
+    st.info("Adjust the GPS coordinates and target date in the sidebar, then click 'Fetch NOAA Data' to pull the weather exposure window.")
