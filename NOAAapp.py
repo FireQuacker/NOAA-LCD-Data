@@ -17,10 +17,9 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 class NOAA_WBGT_Fetcher:
   """Optimized multi-step collector for NOAA Global Hourly (ISD) data using
 
-  NOAA Open Data Dissemination (NODD) AWS S3 buckets. Features geographic
-  radius filtering, ICAO airport station prioritization, local caching,
-  robust column validation, spatial timezone conversion, and working-hour
-  filtering.
+  NOAA Open Data Dissemination (NODD) AWS S3 buckets. Automatically fetches GPS
+  elevation, computes station pressure from sea level pressure, converts dry
+  bulb to Fahrenheit, and calculates relative humidity from dew point.
   """
 
   def __init__(self, cache_dir="./noaa_cache"):
@@ -29,6 +28,7 @@ class NOAA_WBGT_Fetcher:
     self.station_history_url = (
         "https://www.ncei.noaa.gov/pub/data/noaa/isd-history.csv"
     )
+    self.elevation_api_url = "https://api.open-meteo.com/v1/elevation"
     self.session = requests.Session()
     self.session.headers.update({"User-Agent": "OSHA-WBGT-Tool"})
     self.tz_finder = TimezoneFinder()
@@ -52,13 +52,33 @@ class NOAA_WBGT_Fetcher:
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
     return R * c
 
+  def get_elevation(self, lat, lon, logs):
+    """Fetches terrain elevation in meters for the target coordinates."""
+    try:
+      response = self.session.get(
+          self.elevation_api_url,
+          params={"latitude": lat, "longitude": lon},
+          timeout=10,
+      )
+      if response.status_code == 200:
+        data = response.json()
+        elevation = data.get("elevation", [0.0])[0]
+        logs.append(
+            f"Fetched GPS Elevation: {elevation:.1f} meters"
+            f" ({elevation * 3.28084:.1f} ft)."
+        )
+        return float(elevation)
+    except Exception as e:
+      logs.append(
+          f"WARNING: Could not fetch elevation from API ({e}). Defaulting to"
+          " 0.0m."
+      )
+    return 0.0
+
   def get_filtered_candidate_stations(
       self, target_lat, target_lon, target_date_str, logs, max_radius_miles=50.0
   ):
-    """Step 1 & 2: Fetches master station list, calculates distance,
-
-    filters by radius, removes placeholders, and prioritizes ICAO airport stations.
-    """
+    """Fetches master station list, filters by radius, and prioritizes ICAO airport stations."""
     logs.append(
         "Step 1: Fetching NOAA master station history list (isd-history.csv)..."
     )
@@ -78,13 +98,11 @@ class NOAA_WBGT_Fetcher:
       logs.append(f"ERROR: {err}")
       return None, err
 
-    # Clean numeric coordinate columns
     df["LAT"] = pd.to_numeric(df["LAT"], errors="coerce")
     df["LON"] = pd.to_numeric(df["LON"], errors="coerce")
     df = df.dropna(subset=["LAT", "LON"])
     df = df[(df["LAT"] != 0.0) | (df["LON"] != 0.0)].copy()
 
-    # Clean and parse USAF identifiers and filter out placeholder '999999' stations
     df["USAF_CLEAN"] = (
         df["USAF"].astype(str).str.strip().str.split(".").str[0].str.zfill(6)
     )
@@ -101,22 +119,19 @@ class NOAA_WBGT_Fetcher:
         axis=1,
     )
 
-    # Restrict candidate pool strictly to the specified radius
     radius_df = df[df["DIST_MILES"] <= max_radius_miles].copy()
     if radius_df.empty:
       logs.append(
-          "WARNING: No stations found within the strict radius. Expanding"
-          " search to the 15 closest global stations..."
+          "WARNING: No stations found within strict radius. Expanding search"
+          " to 15 closest global stations..."
       )
       radius_df = df.sort_values(by="DIST_MILES").head(15).copy()
 
-    # Step 3: Identify and prioritize stations with valid ICAO codes (ASOS/AWOS/METAR airport weather stations)
     radius_df["ICAO"] = radius_df["ICAO"].astype(str).str.strip()
     radius_df["HAS_ICAO"] = radius_df["ICAO"].apply(
         lambda x: 1 if x and x.upper() != "NAN" and len(x) >= 3 else 0
     )
 
-    # Sort primarily by ICAO presence (1 first), then by distance ascending
     sorted_candidates = radius_df.sort_values(
         by=["HAS_ICAO", "DIST_MILES"], ascending=[False, True]
     ).reset_index(drop=True)
@@ -128,10 +143,7 @@ class NOAA_WBGT_Fetcher:
     return sorted_candidates, None
 
   def get_hourly_data(self, target_lat, target_lon, target_date_str):
-    """Step 4 & 5: Iteratively queries NOAA S3 storage for shortlisted stations,
-
-    validates weather variables, localizes timezones, and extracts working hours.
-    """
+    """Iteratively queries NOAA S3 storage, extracts exact variables, and applies local conversions."""
     logs = []
     target_date = datetime.strptime(target_date_str, "%Y-%m-%d").date()
     target_year = target_date.year
@@ -141,6 +153,8 @@ class NOAA_WBGT_Fetcher:
         f"Target Parameters -> Lat: {target_lat:.4f}, Lon:"
         f" {target_lon:.4f}, Date: {target_date_str} ({days_ago} days ago)"
     )
+
+    elevation_m = self.get_elevation(target_lat, target_lon, logs)
 
     candidates_df, err = self.get_filtered_candidate_stations(
         target_lat, target_lon, target_date_str, logs
@@ -153,11 +167,10 @@ class NOAA_WBGT_Fetcher:
     selected_local_path = None
 
     logs.append(
-        "Step 3 & 4: Iterating through prioritized station shortlist to test"
-        " NOAA S3 archive availability..."
+        "Step 3: Iterating through prioritized station shortlist to test NOAA"
+        " S3 archive availability..."
     )
 
-    # Step 5: Sequential query loop over prioritized short list
     for _, row in candidates_df.iterrows():
       usaf = row["USAF_CLEAN"]
       raw_wban = str(row["WBAN"]).strip().split(".")[0]
@@ -171,7 +184,6 @@ class NOAA_WBGT_Fetcher:
       file_name = f"{station_id}.csv"
       local_path = os.path.join(self.cache_dir, f"{target_year}_{file_name}")
 
-      # Validate cache freshness
       if os.path.exists(local_path):
         file_mod_time = datetime.fromtimestamp(
             os.path.getmtime(local_path)
@@ -198,7 +210,6 @@ class NOAA_WBGT_Fetcher:
       try:
         response = self.session.get(download_url, timeout=20)
         if response.status_code == 200 and len(response.content) > 100:
-          # Verify the CSV contains necessary surface weather columns before accepting
           sample_df = pd.read_csv(
               StringIO(response.text), nrows=5, low_memory=False
           )
@@ -281,27 +292,42 @@ class NOAA_WBGT_Fetcher:
 
     output = []
     for _, row in window_df.iterrows():
-      db = _parse(row.get("TMP"))
-      dp = _parse(row.get("DEW"))
-      ws = _parse(row.get("WND"))
+      db_c = _parse(row.get("TMP"))
+      dp_c = _parse(row.get("DEW"))
+      ws_ms = _parse(row.get("WND"))
+      slp_hpa = _parse(row.get("SLP"))
 
+      # 1. Convert Dry Bulb Temp from Celsius to Fahrenheit
+      db_f = (
+          round((db_c * 9.0 / 5.0) + 32.0, 1) if db_c is not None else None
+      )
+
+      # 2. Calculate Relative Humidity (%) from Dry Bulb and Dew Point fallback
       rh = None
-      if db is not None and dp is not None:
+      if db_c is not None and dp_c is not None:
         rh = round(
             100
             * (
-                10 ** ((7.5 * dp) / (237.3 + dp))
-                / 10 ** ((7.5 * db) / (237.3 + db))
+                10 ** ((7.5 * dp_c) / (237.3 + dp_c))
+                / 10 ** ((7.5 * db_c) / (237.3 + db_c))
             ),
             1,
         )
 
+      # 3. Derive Station Pressure (hPa) from Sea Level Pressure (SLP) using elevation
+      station_pressure = None
+      if slp_hpa is not None:
+        # Standard barometric reduction formula
+        station_pressure = round(
+            slp_hpa * (1 - (0.0065 * elevation_m) / 288.15) ** 5.255, 1
+        )
+
       output.append({
           "Timestamp": row["DATE"],
-          "Dry_Bulb_C": db,
+          "Dry_Bulb_F": db_f,
           "Relative_Humidity_Pct": rh,
-          "Wind_Speed_m_s": ws,
-          "Station_Pressure_hPa": _parse(row.get("SLP")),
+          "Wind_Speed_10m_ms": ws_ms,
+          "Station_Pressure_hPa": station_pressure,
       })
 
     final_df = pd.DataFrame(output)
@@ -346,9 +372,8 @@ class NOAA_WBGT_Fetcher:
     )
     return (
         final_df,
-        f"Successfully localized and extracted data from station"
-        f" '{selected_station_name}' (ID: {selected_station_id}, Timezone:"
-        f" {tz_str}).",
+        f"Successfully extracted variables from station '{selected_station_name}'"
+        f" (ID: {selected_station_id}, Elevation: {elevation_m}m).",
         logs,
     )
 
@@ -363,9 +388,8 @@ st.set_page_config(
 
 st.title("OSHA-WBGT Localized Weather Data Collector")
 st.markdown(
-    "Retrieves, caches, and formats occupational weather data directly from"
-    " NOAA Open Data Dissemination (NODD) S3 feeds using optimized station"
-    " shortlisting."
+    "Extracts Dry Bulb (°F), Relative Humidity (%), Wind Speed 10m (m/s), and"
+    " Station Pressure (hPa) directly from NOAA S3 feeds."
 )
 
 st.sidebar.header("Exposure Parameters")
@@ -391,16 +415,12 @@ default_date = datetime.now() - timedelta(days=5)
 target_date = st.sidebar.date_input("Target Date", value=default_date)
 
 if st.sidebar.button("Fetch NOAA Data", type="primary"):
-  with st.spinner(
-      "Querying master list, shortlisting airport stations, & fetching NOAA S3"
-      " archive..."
-  ):
+  with st.spinner("Querying elevation, stations, & fetching NOAA S3 archive..."):
     fetcher = NOAA_WBGT_Fetcher()
     wbgt_data, message, logs = fetcher.get_hourly_data(
         target_lat, target_lon, target_date.strftime("%Y-%m-%d")
     )
 
-    # Render Troubleshooting & Diagnostic Log Console
     with st.expander("🛠️ Execution Debug & Processing Log", expanded=True):
       for log in logs:
         if log.startswith("ERROR"):
@@ -427,6 +447,6 @@ if st.sidebar.button("Fetch NOAA Data", type="primary"):
       st.error(message)
 else:
   st.info(
-      "Adjust the GPS coordinates and target date in the sidebar, then click"
-      " 'Fetch NOAA Data' to pull the weather exposure window."
+      "Adjust GPS coordinates and target date in the sidebar, then click 'Fetch"
+      " NOAA Data'."
   )
